@@ -1,0 +1,49 @@
+# Built application files
+*.apk
+*.aab
+*.aar
+*.ap_
+
+# Java class files / dex
+*.class
+*.dex
+
+# Generated files
+bin/
+gen/
+out/
+build/
+app/build/
+
+# Gradle
+.gradle/
+
+# Local config (SDK path, signing keys, etc.) — must never be committed
+local.properties
+
+# Logs
+*.log
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+captures/
+.navigation/
+.cxx/
+
+# Keystores / signing
+*.jks
+*.keystore
+
+# Google Services
+google-services.json
+
+# Claude Code tool settings
+.claude/
+
+# Portable toolchain (local only)
+.tools/
+
+# OS
+.DS_Store
+Thumbs.db

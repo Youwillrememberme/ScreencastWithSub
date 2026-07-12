@@ -1,0 +1,4 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base activity theme; Compose (Material3) renders the actual UI. -->
+    <style name="Theme.SubCast" parent="android:Theme.Material.NoActionBar" />
+</resources>
