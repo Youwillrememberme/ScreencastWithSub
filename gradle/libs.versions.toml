@@ -11,6 +11,21 @@ coroutines = "1.8.1"
 room = "2.6.1"
 nanohttpd = "2.3.1"
 jupnp = "2.7.1"
+# jUPnP 2.7.1's POM does not declare slf4j-api (it assumes the consumer brings
+# it), yet jUPnP's code calls org.slf4j.LoggerFactory -- so without this the
+# UpnpServiceConfiguration ctor throws NoClassDefFoundError at runtime. Bring it
+# explicitly. 1.7.30 is API-compatible with jUPnP's 1.7.2 and is cached locally.
+slf4j = "1.7.30"
+# jUPnP 2.7.1 bundles only the Jetty *transport impl* (org.jupnp.transport.impl.jetty),
+# not Jetty itself. The control-point SOAP client (JettyStreamClientImpl) needs
+# jetty-client at runtime. We DON'T add jetty-server: the stream *server*
+# (JettyServletContainer) is overridden to null in DesktopModeUpnpServiceConfiguration
+# because a pure control point doesn't host a GenA callback endpoint.
+# 9.4.x is the last Jetty line that runs on Android (10+ needs Java 11 + jakarta).
+# Cap at 9.4.52: 9.4.53+ added org.eclipse.jetty.util.ModuleLocation, whose bytecode
+# uses MethodHandle.invoke/invokeExact -- signature-polymorphic VM intrinsics that
+# D8 rejects below min-api 26 (we're on 24) and core-desugaring cannot backport.
+jetty = "9.4.52.v20230823"
 ffmpegkit = "6.0-2"
 
 [libraries]
@@ -32,6 +47,8 @@ androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = 
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
 jupnp = { group = "org.jupnp", name = "org.jupnp", version.ref = "jupnp" }
+slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+jetty-client = { group = "org.eclipse.jetty", name = "jetty-client", version.ref = "jetty" }
 ffmpeg-kit-full-gpl = { group = "com.arthenica", name = "ffmpeg-kit-full-gpl", version.ref = "ffmpegkit" }
 
 [plugins]

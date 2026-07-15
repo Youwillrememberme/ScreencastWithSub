@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -29,7 +31,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -38,26 +39,35 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.collectAsState
 import com.subcast.cast.CastPhase
+import com.subcast.dlna.RendererDevice
 import com.subcast.ui.CastViewModel
 import com.subcast.subtitle.SubtitlePosition
 import com.subcast.transcode.TranscodeMode
-import kotlinx.coroutines.launch
 
 @Composable
 fun CastScreen(vm: CastViewModel) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+
+    if (state.showDevicePicker) {
+        DevicePickerDialog(
+            devices = state.devices,
+            onPick = { vm.engine.pickDeviceAndCast(it) },
+            onRefresh = { vm.engine.refreshDevices() },
+            onDismiss = { vm.engine.dismissDevicePicker() },
+        )
+    }
 
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { vm.engine.setVideo(it, queryDisplayName(context, it)) }
@@ -107,25 +117,6 @@ fun CastScreen(vm: CastViewModel) {
             )
         }
 
-        // --- devices ---
-        SectionCard("投屏设备") {
-            if (state.devices.isEmpty()) {
-                Text("正在搜索电视…请确保电视与手机在同一 WiFi", style = MaterialTheme.typography.bodySmall)
-            } else {
-                state.devices.forEach { d ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(
-                            selected = state.selectedDevice?.udn == d.udn,
-                            onClick = { vm.engine.selectDevice(d) }
-                        )
-                        Text(d.friendlyName, modifier = Modifier.clickable { vm.engine.selectDevice(d) })
-                    }
-                }
-            }
-            Spacer(Modifier.height(4.dp))
-            OutlinedButton(onClick = { vm.engine.refreshDevices() }) { Text("重新搜索") }
-        }
-
         // --- mode ---
         SectionCard("转码模式") {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -173,16 +164,38 @@ fun CastScreen(vm: CastViewModel) {
                 }
             }
             Text("颜色", style = MaterialTheme.typography.bodySmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 COLOR_CHOICES.forEach { c ->
+                    val selected = adj.colorArgb == c.argb
                     Box(
                         modifier = Modifier
-                            .size(28.dp)
+                            .size(32.dp)
                             .clip(CircleShape)
                             .background(Color(c.argb))
+                            .border(
+                                width = if (selected) 3.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.outline,
+                                shape = CircleShape
+                            )
                             .clickable { vm.engine.setAdjustments(adj.copy(colorArgb = c.argb)) }
                     )
                 }
+            }
+            // Live preview: proves the chosen color/size actually apply, on a TV-like bar.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF101010))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "字幕预览 Subtitle Preview",
+                    color = Color(adj.colorArgb),
+                    fontSize = (16f * adj.fontSizeScale).coerceIn(10f, 32f).sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
             OutlinedTextField(
                 value = adj.fontName ?: "",
@@ -195,7 +208,7 @@ fun CastScreen(vm: CastViewModel) {
 
         // --- start / status ---
         Button(
-            onClick = { scope.launch { vm.engine.startCast() } },
+            onClick = { vm.engine.onStartCastClicked() },
             enabled = state.canStart,
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -230,6 +243,9 @@ fun CastScreen(vm: CastViewModel) {
         // --- playback controls ---
         if (state.phase == CastPhase.CASTING) {
             SectionCard("播放控制") {
+                state.selectedDevice?.let {
+                    Text("投屏到：${it.friendlyName}", style = MaterialTheme.typography.bodySmall)
+                }
                 val duration = state.durationMs.coerceAtLeast(1L)
                 var seeking by remember { mutableStateOf(false) }
                 var seekFrac by remember { mutableFloatStateOf(0f) }
@@ -273,6 +289,53 @@ private fun SectionCard(title: String, content: @Composable () -> Unit) {
             content()
         }
     }
+}
+
+/**
+ * On-demand device picker, shown after "开始投屏". Lists discovered renderers
+ * live; tapping one selects it and kicks off the cast. Refresh re-fires the
+ * SSDP M-SEARCH; cancel returns to the source screen without casting.
+ */
+@Composable
+private fun DevicePickerDialog(
+    devices: List<RendererDevice>,
+    onPick: (RendererDevice) -> Unit,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择投屏设备") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (devices.isEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.size(8.dp))
+                        Text(
+                            "正在搜索电视…\n请确保手机与电视在同一 WiFi",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                } else {
+                    devices.forEach { d ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(d) }
+                                .padding(vertical = 10.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(d.friendlyName, modifier = Modifier.weight(1f))
+                            Text("›", style = MaterialTheme.typography.titleLarge)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onRefresh) { Text("重新搜索") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @Composable

@@ -6,7 +6,9 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -25,6 +27,11 @@ import org.jupnp.model.types.UDAServiceType
 import org.jupnp.model.types.UDN
 import org.jupnp.registry.Registry
 import org.jupnp.registry.RegistryListener
+import org.jupnp.transport.impl.jetty.JettyStreamClientImpl
+import org.jupnp.transport.impl.jetty.StreamClientConfigurationImpl
+import org.jupnp.transport.spi.NetworkAddressFactory
+import org.jupnp.transport.spi.StreamClient
+import org.jupnp.transport.spi.StreamServer
 import java.util.Locale
 import kotlin.coroutines.resume
 
@@ -37,6 +44,13 @@ private const val TAG = "SubCast/Dlna"
  *
  * Init runs off the main thread and is fully wrapped so any DLNA failure
  * (missing class, network) logs instead of crashing the app.
+ *
+ * NB: UpnpServiceImpl's constructor does NOT start the stack -- it only stores
+ * the configuration and leaves `registry`/`controlPoint`/`router` null and
+ * `isRunning=false`. `startup()` is what binds the SSDP multicast socket,
+ * creates the registry/control-point, and fires the initial M-SEARCH. Skip it
+ * and `service.registry.addListener(...)` NPEs on a null registry; that NPE
+ * is swallowed by runCatching and discovery silently never happens.
  */
 class DlnaController(private val context: Context) {
 
@@ -54,15 +68,26 @@ class DlnaController(private val context: Context) {
     @Volatile
     private var upnp: UpnpService? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var searchJob: Job? = null
 
     private val registryListener = object : RegistryListener {
         override fun remoteDeviceAdded(registry: Registry, device: RemoteDevice) = refresh()
         override fun remoteDeviceRemoved(registry: Registry, device: RemoteDevice) = refresh()
         override fun remoteDeviceUpdated(registry: Registry, device: RemoteDevice) {}
-        override fun remoteDeviceDiscoveryStarted(registry: Registry, device: RemoteDevice) {}
-        override fun remoteDeviceDiscoveryFailed(registry: Registry, device: RemoteDevice, ex: Exception) {}
-        override fun localDeviceAdded(registry: Registry, device: LocalDevice) {}
-        override fun localDeviceRemoved(registry: Registry, device: LocalDevice) {}
+        override fun remoteDeviceDiscoveryStarted(registry: Registry, device: RemoteDevice) {
+            Log.d(TAG, "discovery started: ${device.identity.udn}")
+        }
+        override fun remoteDeviceDiscoveryFailed(registry: Registry, device: RemoteDevice, ex: Exception) {
+            // Most common cause: device descriptor XML unreachable (wrong subnet /
+            // AP isolation). Surfacing it is the only way to debug "can't find TV".
+            Log.w(TAG, "discovery failed: ${device.identity.udn}", ex)
+        }
+        override fun localDeviceAdded(registry: Registry, device: LocalDevice) {
+            Log.d(TAG, "local device added: ${device.identity.udn}")
+        }
+        override fun localDeviceRemoved(registry: Registry, device: LocalDevice) {
+            Log.d(TAG, "local device removed: ${device.identity.udn}")
+        }
         override fun beforeShutdown(registry: Registry) {}
         override fun afterShutdown() {}
     }
@@ -77,18 +102,36 @@ class DlnaController(private val context: Context) {
                         setReferenceCounted(false)
                         acquire()
                     }
-                val service = UpnpServiceImpl(DefaultUpnpServiceConfiguration())
+                // DesktopModeUpnpServiceConfiguration skips jUPnP's Android guard
+                // (it has no published Android module for 2.7.1 -- see the class).
+                val service = UpnpServiceImpl(DesktopModeUpnpServiceConfiguration())
+                // startup() is mandatory: it binds the SSDP multicast socket,
+                // builds the registry/control-point, and fires the first M-SEARCH.
+                service.startup()
                 service.registry.addListener(registryListener)
                 upnp = service
                 service.controlPoint.search()
                 refresh()
             }
-            outcome.onSuccess { _ready.value = true }
-                .onFailure { Log.e(TAG, "DLNA init failed", it) }
+            outcome.onSuccess {
+                _ready.value = true
+                Log.i(TAG, "DLNA ready; listening for renderers")
+                // SSDP is lossy UDP -- a single M-SEARCH can be missed, and some
+                // TVs wake slowly. Re-broadcast for ~60s to fill the list.
+                searchJob?.cancel()
+                searchJob = scope.launch {
+                    repeat(6) {
+                        delay(10_000)
+                        runCatching { upnp?.controlPoint?.search() }
+                    }
+                }
+            }.onFailure { Log.e(TAG, "DLNA init failed", it) }
         }
     }
 
     fun unbind() {
+        searchJob?.cancel()
+        searchJob = null
         runCatching { upnp?.shutdown() }
         runCatching { multicastLock?.release() }
         multicastLock = null
@@ -103,10 +146,15 @@ class DlnaController(private val context: Context) {
     private fun refresh() {
         val reg = upnp?.registry ?: return
         runCatching {
+            // Per-device isolation: a renderer with a malformed descriptor
+            // (e.g. null friendlyName) must not blank the whole list.
             reg.devices.mapNotNull { dev ->
-                if (dev.findService(UDAServiceType("AVTransport", 1)) != null) {
-                    RendererDevice(dev.identity.udn.toString(), dev.details.friendlyName)
-                } else null
+                runCatching {
+                    if (dev.findService(UDAServiceType("AVTransport", 1)) != null) {
+                        RendererDevice(dev.identity.udn.toString(), dev.details.friendlyName)
+                    } else null
+                }.onFailure { Log.w(TAG, "skip device ${dev.identity.udn}", it) }
+                    .getOrNull()
             }
         }.onSuccess { _devices.value = it }
             .onFailure { Log.e(TAG, "refresh failed", it) }
@@ -175,19 +223,23 @@ class DlnaController(private val context: Context) {
     }
 
     suspend fun state(device: RendererDevice): PlaybackState {
-        val svc = avTransportService(liveDevice(device.udn) ?: return PlaybackState.UNKNOWN) ?: return PlaybackState.UNKNOWN
+        val dev = liveDevice(device.udn)
+        if (dev == null) { Log.w(TAG, "state: device ${device.udn} not in registry"); return PlaybackState.UNKNOWN }
+        val svc = avTransportService(dev)
+        if (svc == null) { Log.w(TAG, "state: no AVTransport service"); return PlaybackState.UNKNOWN }
         val inv = actionInvocation(svc, "GetTransportInfo") ?: return PlaybackState.UNKNOWN
         inv.setInput("InstanceID", "0")
         val r = runAction(inv)
-        if (!r.ok) return PlaybackState.UNKNOWN
-        val s = r.invocation?.getOutput("CurrentTransportState")?.value?.toString() ?: return PlaybackState.UNKNOWN
+        if (!r.ok) { Log.w(TAG, "state: GetTransportInfo failed"); return PlaybackState.UNKNOWN }
+        val s = r.invocation?.getOutput("CurrentTransportState")?.value?.toString()
+        Log.d(TAG, "state: CurrentTransportState=$s")
         return when (s) {
             "PLAYING" -> PlaybackState.PLAYING
             "PAUSED_PLAYBACK" -> PlaybackState.PAUSED
             "STOPPED" -> PlaybackState.STOPPED
             "TRANSITIONING" -> PlaybackState.TRANSITIONING
             "NO_MEDIA_PRESENT" -> PlaybackState.NO_MEDIA_PRESENT
-            else -> PlaybackState.UNKNOWN
+            else -> { Log.w(TAG, "state: unmapped transport state '$s' -> UNKNOWN"); PlaybackState.UNKNOWN }
         }
     }
 
@@ -248,5 +300,69 @@ class DlnaController(private val context: Context) {
         val frac = m.groupValues[4]
         val ms = if (frac.isEmpty()) 0L else (frac + "000").substring(0, 3).toLong()
         return ((h * 60 + min) * 60 + sec) * 1000 + ms
+    }
+}
+
+/**
+ * jUPnP 2.7.1 service configuration that bypasses the Android-runtime guard,
+ * without reflection.
+ *
+ * `DefaultUpnpServiceConfiguration`'s real constructor
+ * `(int streamPort, int multicastPort, boolean applyAndroidCheck)` throws
+ * `Error("Unsupported runtime environment, use org.jupnp.android.AndroidUpnpServiceConfiguration")`
+ * when `applyAndroidCheck && ModelUtil.ANDROID_RUNTIME`. The public no-arg
+ * constructor passes that flag as `true`, so it always throws on Android.
+ * The protected `(boolean applyAndroidCheck)` constructor forwards its arg as
+ * that same flag -- so `super(false)` skips the throw and runs the normal
+ * (desktop) init path. This is the escape hatch the unpublished-for-2.7.1
+ * `AndroidUpnpServiceConfiguration` would have used.
+ *
+ * Why not reflection instead: modern ART removed `java.lang.reflect.Field.modifiers`
+ * and blocks `sun.misc.Unsafe` via hidden-API, so neither final-stripping nor
+ * Unsafe could clear `ModelUtil.ANDROID_RUNTIME` on the target device. This
+ * subclass needs none of that.
+ *
+ * The desktop network/transport paths work on Android for SSDP discovery +
+ * SOAP control; we hold the WifiManager multicast lock ourselves.
+ */
+internal class DesktopModeUpnpServiceConfiguration : DefaultUpnpServiceConfiguration {
+    constructor() : super(false)
+
+    /**
+     * Disable the stream *server*. A pure control point (SSDP discovery +
+     * SOAP control) never needs to host an HTTP endpoint: discovery is UDP
+     * multicast, and SOAP actions are outbound HTTP POSTs whose responses
+     * come back over the same client socket. The only consumer of a stream
+     * server is GenA event-callback delivery, which we don't use -- the UI
+     * polls position via GetPositionInfo.
+     *
+     * The default createStreamServer instantiates JettyServletContainer, whose
+     * <clinit> resolves org.eclipse.jetty.server.Server. jUPnP 2.7.1 ships no
+     * transport config except Jetty, and we deliberately don't add jetty-server
+     * (weight + Android quirks) -- so leaving the default would NoClassDefFoundError
+     * inside UpnpServiceImpl.startup() -> RouterImpl.startAddressBasedTransports()
+     * and abort the whole stack. Returning null is safe: RouterImpl null-checks
+     * the result (logs "Configuration did not create a StreamServer for: ...")
+     * and continues to bring up the multicast receiver + stream *client*.
+     *
+     * The stream *client* (createStreamClient -> JettyStreamClientImpl) still
+     * works because we ship jetty-client, which is the only Jetty module it
+     * references (org.eclipse.jetty.client / .http / .util.thread).
+     */
+    override fun createStreamServer(networkAddressFactory: NetworkAddressFactory): StreamServer<*>? = null
+
+    /**
+     * DefaultUpnpServiceConfiguration's `configuration` (StreamClientConfiguration)
+     * field is vestigial: no constructor ever assigns it, so the stock
+     * createStreamClient() hands null to JettyTransportConfiguration, which NPEs
+     * on `config.getTimeoutSeconds()` inside UpnpServiceImpl.startup() ->
+     * RouterImpl.enable(). The never-published-for-2.7.1 AndroidUpnpServiceConfiguration
+     * overrides this same method; we do the equivalent -- build the Jetty HTTP
+     * client (the thing that actually sends SOAP SetAVTransportURI/Play/etc.) with
+     * a fresh config. The single-arg ctor inherits jUPnP's own 10s default timeout.
+     */
+    override fun createStreamClient(): StreamClient<*> {
+        val config = StreamClientConfigurationImpl(getSyncProtocolExecutorService())
+        return JettyStreamClientImpl(config)
     }
 }

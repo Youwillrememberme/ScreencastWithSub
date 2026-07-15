@@ -13,7 +13,11 @@ android {
 
     defaultConfig {
         applicationId = "com.subcast"
-        minSdk = 24
+        // 26 (Android 8.0): jetty-util's ModuleLocation uses MethodHandle.invoke,
+        // a signature-polymorphic VM intrinsic D8 rejects below min-api 26 (and
+        // core-desugaring can't backport). jUPnP's only bundled SOAP client is
+        // Jetty-based, so 26 is the floor for the DLNA stack.
+        minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
@@ -84,6 +88,11 @@ dependencies {
 
     // DLNA / UPnP control point + AVTransport/RenderingControl (jUPnP = maintained Cling fork)
     implementation(libs.jupnp)
+    // jUPnP uses SLF4J but its POM doesn't pull it in -- declare explicitly.
+    implementation(libs.slf4j.api)
+    // jUPnP's control-point SOAP client is JettyStreamClientImpl, which needs
+    // jetty-client at runtime. (Server side is disabled -- see DlnaController.)
+    implementation(libs.jetty.client)
 
     // FFmpeg with libass (ASS/SSA subtitle burn-in); full-gpl build, cached on Aliyun mirror
     implementation(libs.ffmpeg.kit.full.gpl)

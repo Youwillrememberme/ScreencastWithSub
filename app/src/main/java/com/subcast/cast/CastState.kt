@@ -23,13 +23,17 @@ data class CastUiState(
     val adjustments: SubtitleAdjustments = SubtitleAdjustments(),
     val devices: List<RendererDevice> = emptyList(),
     val selectedDevice: RendererDevice? = null,
+    /** True while the device-picker dialog is open (start-cast was pressed). */
+    val showDevicePicker: Boolean = false,
     val playbackState: PlaybackState = PlaybackState.UNKNOWN,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
     val volume: Int = 0,
     val pendingResumeMs: Long? = null,
 ) {
+    // Device selection is deferred to the picker dialog, so only the video
+    // source gates the start button. Subtitle stays optional (no-subtitle cast).
     val canStart: Boolean
-        get() = video != null && selectedDevice != null &&
+        get() = video != null &&
             (phase == CastPhase.IDLE || phase == CastPhase.ERROR)
 }

@@ -1,16 +1,20 @@
 package com.subcast.transcode
 
+import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
 import com.arthenica.ffmpegkit.Statistics
 
+private const val TAG = "SubCast/Transcode"
+
 /**
  * Burns subtitles into a video and re-encodes to a TV-friendly H.264/AAC mp4
  * in a single FFmpeg pass. Two modes share the same pipeline:
  *  - [TranscodeMode.PRE_TRANSCODE]: standard mp4 + faststart, served after completion.
- *  - [TranscodeMode.STREAM]: fragmented mp4 (zerolatency), written to [outputPath]
- *    while the HTTP server serves the growing file (best-effort realtime cast).
+ *  - [TranscodeMode.STREAM]: MPEG-TS (zerolatency), written to [outputPath] while the
+ *    HTTP server serves the growing file (best-effort realtime cast). TS is the DLNA
+ *    live-stream container -- every TV renderer accepts it, unlike fragmented mp4.
  *
  * Callbacks fire on ffmpeg-kit's internal threads; callers switch to the UI
  * thread as needed.
@@ -26,14 +30,21 @@ class Transcoder(private val config: TranscodeConfig) {
         onLog: ((String) -> Unit)? = null
     ) {
         val command = buildCommand()
+        // Surface the exact command + every ffmpeg log line to logcat so a non-zero
+        // rc (the UI only shows "ffmpeg rc=N") can be diagnosed from the stderr.
+        Log.d(TAG, "cmd: $command")
         session = FFmpegKit.executeAsync(
             command,
             { s ->
                 val rc = s.returnCode
                 val ok = ReturnCode.isSuccess(rc)
+                Log.i(TAG, "rc=$rc ok=$ok")
                 onComplete(TranscodeResult(ok, if (ok) null else "ffmpeg rc=$rc"))
             },
-            { log -> onLog?.invoke(log.message) },
+            { log ->
+                Log.d(TAG, log.message)
+                onLog?.invoke(log.message)
+            },
             { stats: Statistics ->
                 val time = stats.time.toLong()
                 val pct = config.sourceDurationMs
@@ -55,22 +66,28 @@ class Transcoder(private val config: TranscodeConfig) {
 
         config.subtitleAssPath?.let { subs ->
             // libass subtitles filter; escapes path for the filtergraph parser.
-            args += listOf("-vf", "subtitles=${escapeFilterPath(subs)}")
+            // fontsdir points fontconfig at Android's system fonts (Roboto + Noto
+            // CJK) -- without it libass finds NO fonts on the device and renders
+            // nothing ("fontselect: failed to find any fallback with glyph 0x0").
+            args += listOf("-vf", "subtitles=${escapeFilterPath(subs)}:fontsdir=/system/fonts")
         }
 
         args += listOf("-c:v", "libx264", "-preset", if (streaming) "ultrafast" else "veryfast")
         if (streaming) args += listOf("-tune", "zerolatency")
         args += listOf("-c:a", "aac", "-b:a", "192k")
 
-        args += if (streaming) {
-            // Fragmented mp4: writeable without knowing total duration up front,
-            // so the file is playable while still being produced.
-            listOf("-movflags", "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd")
+        if (streaming) {
+            // MPEG-TS: the DLNA live-stream container. Streamable by design (no
+            // moov/sample-table to write up front), so the file is playable while
+            // still being produced -- AND every TV DLNA renderer understands it.
+            // The previous fragmented-mp4 (empty_moov) was rejected by the renderer
+            // ("playback failed"): many TV demuxers can't parse fMP4. libx264 emits
+            // annex-B natively, so no h264_mp4toannexb bitstream filter is needed.
+            args += listOf("-f", "mpegts")
         } else {
-            listOf("-movflags", "+faststart")
+            args += listOf("-movflags", "+faststart", "-f", "mp4")
         }
-
-        args += listOf("-f", "mp4", config.outputPath)
+        args += config.outputPath
         return args.joinToString(" ") { shellQuote(it) }
     }
 
