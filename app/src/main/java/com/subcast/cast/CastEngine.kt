@@ -64,6 +64,8 @@ class CastEngine(
 
     init {
         runCatching { mediaServer.start(30_000) }
+            .onSuccess { Log.i(TAG, "MediaServer started, listeningPort=${mediaServer.listeningPort}") }
+            .onFailure { Log.e(TAG, "MediaServer start FAILED", it) }
     }
 
     // ---------------- lifecycle ----------------
@@ -279,11 +281,15 @@ class CastEngine(
                 val vol = dlna.getVolume(device)
                 Log.d(TAG, "poll: state=$st pos=${pos.positionMs}/${pos.durationMs} vol=$vol")
                 update {
+                    // The TV returns HTTP 500 for SOAP queries while playing a live
+                    // MPEG-TS stream; on query failure keep the last known state so
+                    // the UI doesn't flip to "unknown".
+                    val newState = if (st == com.subcast.dlna.PlaybackState.UNKNOWN) it.playbackState else st
                     it.copy(
-                        playbackState = st,
-                        positionMs = pos.positionMs,
+                        playbackState = newState,
+                        positionMs = if (pos.positionMs > 0) pos.positionMs else it.positionMs,
                         durationMs = if (pos.durationMs > 0) pos.durationMs else it.durationMs,
-                        volume = vol
+                        volume = if (vol > 0) vol else it.volume
                     )
                 }
                 delay(1000)

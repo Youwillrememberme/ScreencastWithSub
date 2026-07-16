@@ -15,7 +15,7 @@ object AssWriter {
 
     fun render(track: SubtitleTrack, adj: SubtitleAdjustments = SubtitleAdjustments()): String {
         val base = track.defaultStyle
-        val fontName = adj.fontName ?: base.fontName ?: "Arial"
+        val fontName = adj.fontName ?: base.fontName ?: "MiSans C"
         val fontSize = (base.fontSize * adj.fontSizeScale).toInt().coerceAtLeast(8)
         val primary = argbToAssColor(adj.colorArgb)
         val outline = base.outlineColor ?: "&H00000000&"

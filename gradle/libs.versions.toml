@@ -48,6 +48,7 @@ androidx-room-compiler = { group = "androidx.room", name = "room-compiler", vers
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
 jupnp = { group = "org.jupnp", name = "org.jupnp", version.ref = "jupnp" }
 slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+slf4j-simple = { group = "org.slf4j", name = "slf4j-simple", version.ref = "slf4j" }
 jetty-client = { group = "org.eclipse.jetty", name = "jetty-client", version.ref = "jetty" }
 ffmpeg-kit-full-gpl = { group = "com.arthenica", name = "ffmpeg-kit-full-gpl", version.ref = "ffmpegkit" }
 

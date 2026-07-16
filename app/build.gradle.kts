@@ -90,6 +90,7 @@ dependencies {
     implementation(libs.jupnp)
     // jUPnP uses SLF4J but its POM doesn't pull it in -- declare explicitly.
     implementation(libs.slf4j.api)
+    implementation(libs.slf4j.simple)
     // jUPnP's control-point SOAP client is JettyStreamClientImpl, which needs
     // jetty-client at runtime. (Server side is disabled -- see DlnaController.)
     implementation(libs.jetty.client)

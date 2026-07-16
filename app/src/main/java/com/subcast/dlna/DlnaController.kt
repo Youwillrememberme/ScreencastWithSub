@@ -32,6 +32,19 @@ import org.jupnp.transport.impl.jetty.StreamClientConfigurationImpl
 import org.jupnp.transport.spi.NetworkAddressFactory
 import org.jupnp.transport.spi.StreamClient
 import org.jupnp.transport.spi.StreamServer
+import org.jupnp.transport.Router
+import org.jupnp.transport.impl.MulticastReceiverConfigurationImpl
+import org.jupnp.transport.impl.MulticastReceiverImpl
+import org.jupnp.transport.spi.DatagramProcessor
+import org.jupnp.transport.spi.InitializationException
+import org.jupnp.transport.spi.MulticastReceiver
+import org.jupnp.transport.impl.DatagramIOConfigurationImpl
+import org.jupnp.transport.impl.DatagramIOImpl
+import org.jupnp.transport.spi.DatagramIO
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.MulticastSocket
+import java.net.NetworkInterface
 import java.util.Locale
 import kotlin.coroutines.resume
 
@@ -96,6 +109,17 @@ class DlnaController(private val context: Context) {
         scope.launch {
             // Fully wrap init so any failure logs instead of crashing the app.
             val outcome = runCatching {
+                // Enable jUPnP's slf4j debug logs (SOAP requests/responses) to see
+                // the TV's real 500 response body when query/control actions fail.
+                System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "DEBUG")
+                // Force the IPv4 stack. With cellular IPv6 interfaces present
+                // (rmnet_data*), Java/jUPnP otherwise bind the SSDP multicast
+                // socket to [::]:1900 (IPv6), which the IPv4 TV never receives --
+                // discovery silently finds nothing even though the TV answers
+                // SSDP from 192.168.110.2. Must be set before any socket is
+                // created, i.e. before UpnpServiceImpl startup.
+                System.setProperty("java.net.preferIPv4Stack", "true")
+                System.setProperty("java.net.preferIPv4Addresses", "true")
                 multicastLock = (context.applicationContext
                     .getSystemService(Context.WIFI_SERVICE) as WifiManager)
                     .createMulticastLock("subcast-dlna").apply {
@@ -123,6 +147,7 @@ class DlnaController(private val context: Context) {
                     repeat(6) {
                         delay(10_000)
                         runCatching { upnp?.controlPoint?.search() }
+                        Log.i(TAG, "diag: after search regN=${upnp?.registry?.devices?.size}")
                     }
                 }
             }.onFailure { Log.e(TAG, "DLNA init failed", it) }
@@ -277,8 +302,10 @@ class DlnaController(private val context: Context) {
             }
             cp.execute(object : ActionCallback(invocation) {
                 override fun success(inv: ActionInvocation<*>?) = cont.resume(ActionResult(true, inv))
-                override fun failure(inv: ActionInvocation<*>?, op: UpnpResponse?, msg: String?) =
+                override fun failure(inv: ActionInvocation<*>?, op: UpnpResponse?, msg: String?) {
+                    Log.w(TAG, "action failed: ${inv?.action?.name} status=${op?.statusCode} ${op?.statusMessage} msg=$msg")
                     cont.resume(ActionResult(false, inv))
+                }
             })
         }
 
@@ -364,5 +391,91 @@ internal class DesktopModeUpnpServiceConfiguration : DefaultUpnpServiceConfigura
     override fun createStreamClient(): StreamClient<*> {
         val config = StreamClientConfigurationImpl(getSyncProtocolExecutorService())
         return JettyStreamClientImpl(config)
+    }
+
+    /**
+     * Use an IPv4-bound multicast receiver. The stock MulticastReceiverImpl uses
+     * `new MulticastSocket(port)`, which on a dual-stack Android device with
+     * cellular IPv6 binds [::]:port (IPv6) -- the IPv4 TV never receives our
+     * SSDP M-SEARCH and discovery silently finds nothing. (java.net
+     * .preferIPv4Stack is ignored by Android's network stack, so we fix it
+     * here instead.)
+     */
+    override fun createMulticastReceiver(networkAddressFactory: NetworkAddressFactory): MulticastReceiver<*> {
+        Log.i(TAG, "diag: createMulticastReceiver called")
+        return IPv4MulticastReceiver(
+            MulticastReceiverConfigurationImpl(
+                networkAddressFactory.multicastGroup,
+                networkAddressFactory.multicastPort
+            )
+        )
+    }
+
+    /**
+     * Stock DatagramIOImpl.init() never calls setNetworkInterface(), so the
+     * M-SEARCH multicast leaves on the default-route interface -- with cellular
+     * present that's the IPv6 rmnet, and the IPv4 TV never receives it. Force
+     * the multicast output interface to the one carrying bindAddr (wlan0).
+     */
+    override fun createDatagramIO(networkAddressFactory: NetworkAddressFactory): DatagramIO<*> {
+        return IPv4DatagramIO(DatagramIOConfigurationImpl())
+    }
+}
+
+/**
+ * DatagramIOImpl that sets the multicast output interface (stock never does),
+ * so M-SEARCH actually leaves on wlan0 toward the IPv4 TV.
+ */
+private class IPv4DatagramIO(
+    configuration: DatagramIOConfigurationImpl
+) : DatagramIOImpl(configuration) {
+    override fun init(bindAddr: InetAddress, port: Int, r: Router, dp: DatagramProcessor) {
+        super.init(bindAddr, port, r, dp)
+        try {
+            val nif = NetworkInterface.getByInetAddress(bindAddr)
+            if (nif != null) socket.networkInterface = nif
+            Log.i(TAG, "diag: DatagramIO bindAddr=$bindAddr port=$port nif=${nif?.name} socketLocal=${socket.localAddress} v4=${socket.localAddress is java.net.Inet4Address} v6=${socket.localAddress is java.net.Inet6Address}")
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: DatagramIO setNI failed", e)
+        }
+    }
+}
+
+/**
+ * MulticastReceiverImpl whose init() binds an IPv4 wildcard socket instead of
+ * the stock `new MulticastSocket(port)` (which binds IPv6 [::] on dual-stack
+ * Android). Everything else mirrors the stock implementation.
+ */
+private class IPv4MulticastReceiver(
+    configuration: MulticastReceiverConfigurationImpl
+) : MulticastReceiverImpl(configuration) {
+    override fun init(
+        ni: NetworkInterface,
+        r: Router,
+        naf: NetworkAddressFactory,
+        dp: DatagramProcessor
+    ) {
+        Log.i(TAG, "diag: IPv4MulticastReceiver.init called")
+        try {
+            router = r
+            networkAddressFactory = naf
+            datagramProcessor = dp
+            multicastInterface = ni
+            val port = configuration.port
+            multicastAddress = InetSocketAddress(configuration.group, port)
+            val ipv4 = java.util.Collections.list(ni.inetAddresses).firstOrNull { it is java.net.Inet4Address }
+                ?: InetAddress.getByName("0.0.0.0")
+            Log.i(TAG, "diag: getByName(0.0.0.0)=${InetAddress.getByName("0.0.0.0").javaClass.simpleName} ni-ipv4=$ipv4")
+            socket = MulticastSocket(InetSocketAddress(ipv4, port))
+            Log.i(TAG, "diag: socket local=${socket.localAddress}/${socket.localPort} bound=${socket.isBound} v4=${socket.localAddress is java.net.Inet4Address} v6=${socket.localAddress is java.net.Inet6Address}")
+            Log.i(TAG, "diag: IPv4 socket bound, joining group ${configuration.group}:${port} on ${ni.name}")
+            socket.reuseAddress = true
+            socket.receiveBufferSize = 32768
+            socket.joinGroup(multicastAddress, ni)
+            Log.i(TAG, "diag: joined group OK")
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: IPv4 init FAILED", e)
+            throw InitializationException("Could not init IPv4 multicast receiver: $e", e)
+        }
     }
 }

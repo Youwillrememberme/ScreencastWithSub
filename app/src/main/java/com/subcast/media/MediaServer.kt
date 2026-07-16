@@ -32,7 +32,7 @@ private const val TAG = "SubCast/Media"
  * player keys playback off the HTTP Content-Type, so a mismatch reads as
  * "playback failed" on the TV even though the bytes are correct.
  */
-class MediaServer(port: Int = 8080) : NanoHTTPD(port) {
+class MediaServer(port: Int = 0) : NanoHTTPD(port) {
 
     data class MediaRef(val file: File, val token: String, val live: Boolean, val mimeType: String)
 
